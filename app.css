@@ -160,3 +160,47 @@ a.btn{text-decoration:none;display:inline-block}
   .lede{font-size:13.5px}
 }
 @media (max-width:900px){ .shell{grid-template-columns:minmax(0,1fr)} .side,.main{min-width:0} }
+
+/* ---- live scanner ---- */
+.cam .ov{position:absolute;inset:0;width:100%;height:100%;transform:scaleX(-1);pointer-events:none}
+.cam .guide{transition:border-color .2s}
+.cam .guide.ok{border:3px solid #4fd18b}
+.cam .msg{font-size:13px;text-align:center;font-weight:500}
+
+/* ---- licence card (scales with its width, like a real card) ---- */
+.lflip{perspective:1400px;max-width:440px;margin:0 auto;cursor:pointer;container-type:inline-size}
+.lin{position:relative;aspect-ratio:1.586;transition:transform .7s cubic-bezier(.3,.7,.2,1);transform-style:preserve-3d}
+.lflip.flipped .lin{transform:rotateY(180deg)}
+.lface{position:absolute;inset:0;border-radius:3.2cqw;overflow:hidden;backface-visibility:hidden;-webkit-backface-visibility:hidden;
+  box-shadow:0 1px 0 #fff inset,0 10px 28px -12px #1c211e66,0 2px 6px -2px #1c211e33}
+.front{background-color:#fbf7ee;background-size:100% auto;background-position:center 60%;border:1px solid #e3dac4;display:flex;flex-direction:column;padding:3.6cqw 4cqw 0}
+.front:after{content:"";position:absolute;right:-8cqw;top:-10cqw;width:42cqw;height:42cqw;border-radius:50%;border:1px solid #1f4d3a12;box-shadow:0 0 0 3cqw #1f4d3a06}
+.ltop{display:flex;justify-content:space-between;align-items:center;position:relative;z-index:1}
+.lbrand{display:flex;align-items:center;gap:1.4cqw;color:var(--green);font:600 2.8cqw var(--sans);letter-spacing:.3cqw;text-transform:uppercase}
+.lbrand svg{color:var(--orange);width:4.2cqw;height:4.2cqw}
+.lpill{font:500 2.4cqw var(--sans);letter-spacing:.1cqw;padding:.7cqw 2cqw;border-radius:5cqw;border:1px solid}
+.lpill.ok{color:#2f6f4a;border-color:#9cc9ac;background:#eef7f1}
+.lpill.warn{color:#8a6a0d;border-color:#e1c97c;background:#fbf5e2}
+.lpill.bad{color:#a3302a;border-color:#e0aaa5;background:#fbf1ef}
+.lmain{display:flex;gap:3.6cqw;margin-top:3cqw;flex:1;min-height:0;position:relative;z-index:1}
+.lph{width:25cqw;height:31cqw;object-fit:cover;border-radius:2cqw;border:1px solid #e3dac4;background:#e9e2d0;flex-shrink:0}
+.lini{display:flex;align-items:center;justify-content:center;font:500 6cqw var(--mono);color:#7c7563}
+.linfo{min-width:0;flex:1;display:flex;flex-direction:column}
+.lkind{font:500 2.1cqw var(--sans);letter-spacing:.25cqw;text-transform:uppercase;color:var(--mute)}
+.lkind.light{color:#b7c9bd}
+.lname{font:600 4.9cqw/1.12 var(--serif);margin:1cqw 0 .8cqw;color:var(--ink);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.lno{font:500 2.9cqw var(--mono);letter-spacing:.25cqw;color:var(--green)}
+.lmeta{display:grid;grid-template-columns:repeat(3,auto);justify-content:start;gap:.5cqw 4cqw;margin-top:auto;padding-bottom:1cqw;font-size:2.7cqw;white-space:nowrap}
+.lmeta span{display:block;font-size:1.9cqw;letter-spacing:.2cqw;text-transform:uppercase;color:var(--mute)}
+.lclasses{display:flex;gap:1cqw;flex-wrap:wrap;padding:2cqw 0 4cqw;position:relative;z-index:1}
+.lclasses span{font:500 2.4cqw var(--mono);padding:.7cqw 1.6cqw;border-radius:1cqw;background:var(--green);color:#f4f1e8}
+.ltais{position:absolute;left:0;right:0;bottom:0;height:1.5cqw;
+  background:repeating-linear-gradient(90deg,#c8501a 0 3.2cqw,#1c211e 3.2cqw 4.1cqw,#e7c56a 4.1cqw 5.5cqw,#1c211e 5.5cqw 6.4cqw,#7a2a1a 6.4cqw 9.1cqw,#f3ead6 9.1cqw 10cqw)}
+.back{background:#1f4d3a;color:#eef0e8;transform:rotateY(180deg);display:grid;grid-template-columns:30cqw 1fr;grid-template-rows:1fr auto auto;column-gap:4.5cqw;padding:4.5cqw 4.5cqw 4cqw}
+.lqr{background:#fff;padding:2cqw;border-radius:2cqw;align-self:start}
+.lqr svg{display:block;width:100%;height:auto}
+.lback-info ul{list-style:none;margin:1.4cqw 0 0;padding:0;font-size:2.8cqw}
+.lback-info li{padding:.5cqw 0}
+.lback-info li b{font:500 2.5cqw var(--mono);display:inline-block;width:9cqw;color:#e7c56a}
+.lbfoot{grid-column:1/-1;display:flex;justify-content:space-between;border-top:1px solid #ffffff22;padding-top:1.8cqw;margin-top:2cqw;font:500 2.5cqw var(--mono);color:#dfe6dd}
+.lfine{grid-column:1/-1;font-size:2.2cqw;color:#9fb5a7;margin-top:.8cqw}

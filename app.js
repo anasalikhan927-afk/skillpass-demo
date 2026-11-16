@@ -40,7 +40,13 @@
   const KEY = 'skillpass.v1';
   const store = {
     load() { try { return JSON.parse(localStorage.getItem(KEY)) || null; } catch (e) { return null; } },
-    save() { try { localStorage.setItem(KEY, JSON.stringify(DB)); } catch (e) { toast('Could not save on this device (storage full or blocked).'); } }
+    save() {
+      try {
+        const s = JSON.stringify(DB); localStorage.setItem(KEY, s);
+        if (localStorage.getItem(KEY) !== s) throw new Error('verify');
+        return true;
+      } catch (e) { toast('Could not save on this device. Open the link in Chrome or Safari (not inside WhatsApp), and not in private mode.'); return false; }
+    }
   };
 
   function seed() {
@@ -69,6 +75,7 @@
 
   let DB = store.load() || seed();
   if (!store.load()) store.save();
+  try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
 
   // ---------- helpers ----------
   const $ = (s, r = document) => r.querySelector(s);
@@ -129,37 +136,70 @@
   setInterval(() => { $('#clock').textContent = new Date().toLocaleString('en-GB', { weekday: 'short', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) + ' TLT'; }, 1000);
 
   // ---------- face engine ----------
+  const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
   const Face = {
-    ready: false, loading: null,
+    ready: false, loading: null, mode: 'gpu',
+    opts() { return new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.45 }); },
+    async toCpu() {
+      try { await faceapi.tf.setBackend('cpu'); await faceapi.tf.ready(); this.mode = 'cpu'; } catch (e) { console.error(e); }
+    },
+    async warm() {
+      const c = document.createElement('canvas'); c.width = 160; c.height = 160;
+      c.getContext('2d').fillRect(0, 0, 160, 160);
+      await faceapi.detectAllFaces(c, this.opts());
+      await faceapi.computeFaceDescriptor(c);
+    },
     async load(statusEl) {
       if (this.ready) return true;
-      if (!window.faceapi) { if (statusEl) statusEl.textContent = 'Face library did not load.'; return false; }
+      if (!window.faceapi) { if (statusEl) statusEl.textContent = 'Face library did not load. Check the internet connection and reload.'; return false; }
       if (!this.loading) {
         this.loading = (async () => {
           const bases = ['https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.15/model', 'models'];
-          let lastErr;
+          let lastErr, loaded = false;
           for (const base of bases) {
             try {
               await faceapi.nets.tinyFaceDetector.loadFromUri(base);
               await faceapi.nets.faceLandmark68TinyNet.loadFromUri(base);
               await faceapi.nets.faceRecognitionNet.loadFromUri(base);
-              this.ready = true; return;
+              loaded = true; break;
             } catch (e) { lastErr = e; }
           }
-          throw lastErr;
+          if (!loaded) throw lastErr;
+          // Warm up. Some phones hang or crawl on the GPU path; fall back to CPU.
+          try {
+            await faceapi.tf.ready();
+            if (faceapi.tf.getBackend() !== 'webgl') this.mode = 'cpu';
+            await withTimeout(this.warm(), 12000);
+          } catch (e) {
+            await this.toCpu();
+            await withTimeout(this.warm(), 30000).catch(() => {});
+          }
+          this.ready = true;
         })();
       }
-      if (statusEl) statusEl.textContent = 'Loading face models (first time only, ~7 MB)…';
-      try { await this.loading; return true; } catch (e) { console.error(e); this.loading = null; if (statusEl) statusEl.textContent = 'Could not load face models.'; return false; }
+      if (statusEl) statusEl.textContent = 'Preparing face engine (first time only, up to 30 s)…';
+      try { await this.loading; return true; } catch (e) { console.error(e); this.loading = null; if (statusEl) statusEl.textContent = 'Could not load face models. Check the internet connection.'; return false; }
     },
-    async describe(input) {
-      const opts = new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.45 });
-      const all = await faceapi.detectAllFaces(input, opts);
+    async describeOnce(input) {
+      const all = await faceapi.detectAllFaces(input, this.opts());
       if (all.length === 0) return { error: 'No face found. Face the camera in good light and try again.' };
       if (all.length > 1) return { error: 'More than one face in the picture. Only the trainee should be in frame.' };
-      const r = await faceapi.detectSingleFace(input, opts).withFaceLandmarks(true).withFaceDescriptor();
+      const r = await faceapi.detectSingleFace(input, this.opts()).withFaceLandmarks(true).withFaceDescriptor();
       if (!r) return { error: 'Face found but could not be read clearly. Try again.' };
       return { descriptor: Array.from(r.descriptor), score: r.detection.score, box: r.detection.box };
+    },
+    async describe(input) {
+      input = shrink(input, 480);
+      const k = input._scale || 1;
+      const fix = (r) => { if (r && r.box) { const b = r.box; r.box = { x: b.x * k, y: b.y * k, width: b.width * k, height: b.height * k }; } return r; };
+      try { return fix(await withTimeout(this.describeOnce(input), this.mode === 'cpu' ? 40000 : 15000)); }
+      catch (e) {
+        if (this.mode !== 'cpu') {
+          await this.toCpu();
+          try { return fix(await withTimeout(this.describeOnce(input), 40000)); } catch (e2) { /* fall through */ }
+        }
+        return { error: 'Reading the face took too long on this device. Please try again.' };
+      }
     },
     match(desc) {
       let best = null;
@@ -174,45 +214,111 @@
     THRESH: 0.5
   };
 
-  // ---------- camera widget ----------
-  let stream = null;
-  function stopCamera() { if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; } }
+  function shrink(src, max) {
+    const w = src.width || src.videoWidth, h = src.height || src.videoHeight;
+    if (!w || Math.max(w, h) <= max) return src;
+    const s = max / Math.max(w, h), c = document.createElement('canvas');
+    c.width = Math.round(w * s); c.height = Math.round(h * s);
+    c.getContext('2d').drawImage(src, 0, 0, c.width, c.height);
+    c._scale = 1 / s; return c;
+  }
 
-  /* Renders a capture box into el. Calls onShot(canvas) with the captured frame. */
+  // ---------- camera widget (live scanner) ----------
+  let stream = null, scanTimer = null;
+  function stopCamera() {
+    if (scanTimer) { clearTimeout(scanTimer); scanTimer = null; }
+    if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  }
+
+  /* Renders a live face scanner into el. Auto-captures when one face is centred and steady.
+     Calls onShot(canvas, say) with the captured frame. */
   function cameraBox(el, onShot, label) {
     el.innerHTML = `
-      <div class="cam"><div class="empty" data-empty>Camera is off.</div><div class="guide" hidden></div><div class="msg" data-msg hidden></div></div>
+      <div class="cam"><div class="empty" data-empty>Camera is off</div><canvas class="ov" hidden></canvas><div class="guide" hidden></div><div class="msg" data-msg hidden></div></div>
       <div class="row" style="margin-top:10px">
-        <button class="btn" data-start>Open camera</button>
-        <button class="btn or" data-snap hidden>${esc(label || 'Take picture')}</button>
+        <button class="btn" data-start>Start scanner</button>
+        <button class="btn alt" data-snap hidden>${esc(label || 'Capture now')}</button>
         <label class="btn alt" style="display:inline-block">Use a photo<input type="file" accept="image/*" capture="user" hidden data-file></label>
       </div>`;
-    const cam = $('.cam', el), msg = $('[data-msg]', el), empty = $('[data-empty]', el);
+    const cam = $('.cam', el), msg = $('[data-msg]', el), empty = $('[data-empty]', el), guide = $('.guide', el), ov = $('.ov', el);
     const say = (t) => { msg.hidden = !t; msg.textContent = t || ''; };
+    let good = 0, busy = false, done = false;
+
+    function draw(dets, ok) {
+      const v = $('video', cam); if (!v) return;
+      ov.width = v.videoWidth; ov.height = v.videoHeight;
+      const g = ov.getContext('2d'); g.clearRect(0, 0, ov.width, ov.height);
+      g.strokeStyle = ok ? '#4fd18b' : '#ffffffcc'; g.lineWidth = Math.max(3, ov.width / 160);
+      dets.forEach(d => {
+        const { x, y, width: w, height: h } = d.box, L = Math.min(w, h) * 0.22;
+        g.beginPath();
+        [[x, y, 1, 1], [x + w, y, -1, 1], [x, y + h, 1, -1], [x + w, y + h, -1, -1]].forEach(([px, py, sx, sy]) => {
+          g.moveTo(px + sx * L, py); g.lineTo(px, py); g.lineTo(px, py + sy * L);
+        });
+        g.stroke();
+      });
+    }
+
+    function capture() {
+      const v = $('video', cam); if (!v || done) return;
+      done = true;
+      const c = document.createElement('canvas'); c.width = v.videoWidth; c.height = v.videoHeight;
+      const ctx = c.getContext('2d'); ctx.translate(c.width, 0); ctx.scale(-1, 1); ctx.drawImage(v, 0, 0);
+      stopCamera(); v.remove(); ov.hidden = true; guide.hidden = true; cam.prepend(c);
+      $('[data-snap]', el).hidden = true; const st = $('[data-start]', el); st.hidden = false; st.textContent = 'Scan again';
+      onShot(c, say);
+    }
+
+    async function tick() {
+      const v = $('video', cam);
+      if (!stream || !v || done) return;
+      if (!busy && v.readyState >= 2 && v.videoWidth) {
+        busy = true;
+        try {
+          const dets = await withTimeout(faceapi.detectAllFaces(v, Face.opts()), Face.mode === 'cpu' ? 8000 : 4000);
+          if (done) return;
+          const W = v.videoWidth, H = v.videoHeight;
+          let ok = false;
+          if (dets.length === 0) { good = 0; say('Looking for a face…'); }
+          else if (dets.length > 1) { good = 0; say('Only one person in front of the camera'); }
+          else {
+            const b = dets[0].box, cx = (b.x + b.width / 2) / W, cy = (b.y + b.height / 2) / H, size = b.width / W;
+            if (size < 0.2) { good = 0; say('Move a little closer'); }
+            else if (size > 0.75) { good = 0; say('Move back a little'); }
+            else if (Math.abs(cx - 0.5) > 0.22 || Math.abs(cy - 0.5) > 0.26) { good = 0; say('Centre your face in the oval'); }
+            else { ok = true; good++; say(good >= 3 ? 'Got it' : 'Hold still…'); }
+          }
+          guide.classList.toggle('ok', ok);
+          draw(dets, ok);
+          if (good >= 3) { busy = false; capture(); return; }
+        } catch (e) {
+          if (Face.mode !== 'cpu') { say('Switching to compatibility mode…'); await Face.toCpu(); }
+        }
+        busy = false;
+      }
+      scanTimer = setTimeout(tick, Face.mode === 'cpu' ? 400 : 150);
+    }
+
     $('[data-start]', el).onclick = async () => {
-      stopCamera();
+      stopCamera(); done = false; good = 0;
       try {
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('nocam');
         stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
-        const v = document.createElement('video'); v.playsInline = true; v.muted = true; v.srcObject = stream;
-        cam.querySelectorAll('video,canvas,img').forEach(n => n.remove());
+        const v = document.createElement('video'); v.playsInline = true; v.muted = true; v.setAttribute('playsinline', ''); v.srcObject = stream;
+        cam.querySelectorAll('video,canvas:not(.ov),img').forEach(n => n.remove());
         cam.prepend(v); await v.play();
-        empty.hidden = true; $('.guide', el).hidden = false;
+        empty.hidden = true; guide.hidden = false; guide.classList.remove('ok'); ov.hidden = false;
         $('[data-snap]', el).hidden = false; $('[data-start]', el).hidden = true;
-        say('Keep the face inside the oval');
-        Face.load(); // warm up in background
+        say('Preparing face scanner…');
+        const ok = await Face.load({ set textContent(t) { say(t); } });
+        if (!ok || !stream) return;
+        say('Looking for a face…');
+        tick();
       } catch (e) {
-        empty.textContent = 'Camera not available here. Use “Use a photo” instead — on a phone it opens the camera.';
+        empty.textContent = 'Camera not available here. Use “Use a photo” — on a phone it opens the camera.';
       }
     };
-    $('[data-snap]', el).onclick = () => {
-      const v = $('video', cam); if (!v) return;
-      const c = document.createElement('canvas'); c.width = v.videoWidth; c.height = v.videoHeight;
-      const ctx = c.getContext('2d'); ctx.translate(c.width, 0); ctx.scale(-1, 1); ctx.drawImage(v, 0, 0);
-      stopCamera(); v.remove(); cam.prepend(c); $('.guide', el).hidden = true;
-      $('[data-snap]', el).hidden = true; $('[data-start]', el).hidden = false; $('[data-start]', el).textContent = 'Retake';
-      onShot(c, say);
-    };
+    $('[data-snap]', el).onclick = capture;
     $('[data-file]', el).onchange = (e) => {
       const f = e.target.files && e.target.files[0]; if (!f) return;
       const img = new Image();
@@ -220,8 +326,9 @@
         const scale = Math.min(1, 900 / Math.max(img.width, img.height));
         const c = document.createElement('canvas'); c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
         c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
-        stopCamera(); cam.querySelectorAll('video,canvas,img').forEach(n => n.remove()); cam.prepend(c);
-        empty.hidden = true; $('.guide', el).hidden = true; $('[data-snap]', el).hidden = true;
+        stopCamera(); done = true; cam.querySelectorAll('video,canvas:not(.ov),img').forEach(n => n.remove()); cam.prepend(c);
+        empty.hidden = true; guide.hidden = true; ov.hidden = true; $('[data-snap]', el).hidden = true;
+        $('[data-start]', el).hidden = false;
         onShot(c, say);
         URL.revokeObjectURL(img.src);
       };
@@ -238,7 +345,9 @@
     if (box) {
       const cx = box.x + box.width / 2, cy = box.y + box.height / 2;
       sw = Math.min(canvas.width, box.width * 1.9); sh = sw * 1.25;
-      sx = Math.max(0, cx - sw / 2); sy = Math.max(0, cy - sh / 2 - box.height * 0.08);
+      if (sh > canvas.height) { sh = canvas.height; sw = sh / 1.25; }
+      sx = Math.min(Math.max(0, cx - sw / 2), canvas.width - sw);
+      sy = Math.min(Math.max(0, cy - sh / 2 - box.height * 0.08), canvas.height - sh);
     }
     ctx.drawImage(canvas, sx, sy, sw, sh, 0, 0, 160, 200);
     return t.toDataURL('image/jpeg', 0.78);
@@ -378,7 +487,7 @@
         const dup = Face.match(r.descriptor);
         if (dup && dup.d < 0.42) { say(''); toast(`This face looks like ${dup.p.name} (${dup.p.id}), already registered.`); }
         reg.face = [r.descriptor]; reg.photo = thumbFrom(canvas, r.box);
-        say('Face captured · detection ' + Math.round(r.score * 100) + '%');
+        say('Face captured · detection ' + Math.round(r.score * 100) + '% · ' + Face.mode);
         $('#regShot').innerHTML = `<img class="thumb" src="${reg.photo}"><span class="st ok">Face captured</span>`;
         $('#next2').disabled = false;
       }, 'Take picture');
@@ -396,8 +505,10 @@
         const p = { id: reg.id, name: reg.data.name, dob: reg.data.dob, phone: reg.data.phone, mun: reg.data.mun, employer: reg.data.employer || 'Independent',
           classes: reg.data.classes, issued: todayISO(), status: 'Pending assessment', licence: 'TL-OHS-' + yy + '-' + String(Math.floor(10000 + Math.random() * 89999)),
           face: reg.face, photo: reg.photo, cred: reg.cred, created: todayISO() };
-        DB.people.unshift(p); if (navigator.onLine === false) DB.queue++; store.save(); updateSync();
-        reg = null; toast(`${p.name} registered (${p.id}).`);
+        DB.people.unshift(p); if (navigator.onLine === false) DB.queue++;
+        if (!store.save()) { DB.people.shift(); return; }
+        updateSync();
+        reg = null; toast(`Saved on this device: ${p.name} (${p.id}).`);
         location.hash = 'licence-' + p.licence;
       };
     }
@@ -498,33 +609,100 @@
           <td><span class="st ${p.status === 'Current' ? 'ok' : p.status === 'Suspended' ? 'bad' : 'warn'}">${p.status}</span></td>
           <td class="small hide-m">${p.face ? 'Face' : ''}${p.face && p.cred ? ' · ' : ''}${p.cred ? 'Finger' : ''}${!p.face && !p.cred ? '<span class="mute">—</span>' : ''}</td></tr>`).join('')}
         </table>
-        <div class="row" style="margin-top:14px"><button class="btn alt" id="resetDemo">Reset demo data</button></div>
+        <div class="note" style="margin-top:14px">Records are saved in this browser on this device. To move them to another phone or laptop, use <b>Back up</b> here and <b>Restore</b> there.</div>
+        <div class="row" style="margin-top:10px"><button class="btn alt" id="backup">Back up register</button>
+          <label class="btn alt" style="display:inline-block">Restore from backup<input type="file" accept=".json,application/json" hidden id="restore"></label>
+          <button class="btn alt" id="resetDemo">Reset demo data</button></div>
       </div>`;
   };
   V.licences.after = function () {
     const i = $('#licQ'); i.oninput = () => { licQ = i.value; const pos = i.selectionStart; render(); const j = $('#licQ'); j.focus(); j.setSelectionRange(pos, pos); };
     document.querySelectorAll('tr[data-l]').forEach(r => r.onclick = () => (location.hash = 'licence-' + r.dataset.l));
+    $('#backup').onclick = () => {
+      const blob = new Blob([JSON.stringify(DB)], { type: 'application/json' });
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+      a.download = 'skillpass-register-' + todayISO() + '.json'; document.body.appendChild(a); a.click();
+      setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+      toast('Backup file downloaded.');
+    };
+    $('#restore').onchange = (e) => {
+      const f = e.target.files && e.target.files[0]; if (!f) return;
+      f.text().then(t => {
+        const data = JSON.parse(t);
+        if (!data || !Array.isArray(data.people)) throw new Error('bad');
+        let added = 0;
+        data.people.forEach(p => {
+          const i = DB.people.findIndex(x => x.id === p.id);
+          if (i < 0) { DB.people.push(p); added++; } else if (p.face && !DB.people[i].face) { DB.people[i] = p; added++; }
+        });
+        const seen = new Set(DB.checkins.map(c => c.pid + c.date + c.time));
+        (data.checkins || []).forEach(c => { if (!seen.has(c.pid + c.date + c.time)) DB.checkins.push(c); });
+        store.save(); render(); toast(`Restored. ${added} trainee record${added === 1 ? '' : 's'} added or updated.`);
+      }).catch(() => toast('That file is not a SkillPass backup.'));
+      e.target.value = '';
+    };
     $('#resetDemo').onclick = () => {
       modal(`<h2>Reset demo data?</h2><p class="small">Removes everyone you registered and all check-ins on this device.</p><div class="row"><button class="btn alt" id="rNo">Keep</button><button class="btn or" id="rYes">Reset</button></div>`);
       $('#rNo').onclick = closeModal; $('#rYes').onclick = () => { DB = seed(); store.save(); closeModal(); updateSync(); render(); toast('Demo data reset.'); };
     };
   };
 
+  const GUILLOCHE = (function () {
+    let paths = '';
+    for (let k = 0; k < 9; k++) {
+      let d = '';
+      for (let x = 0; x <= 400; x += 4) {
+        const y = 60 + k * 9 + Math.sin(x / 26 + k * 0.7) * 14 + Math.sin(x / 9 + k) * 2;
+        d += (x ? 'L' : 'M') + x + ' ' + y.toFixed(1);
+      }
+      paths += `<path d="${d}" fill="none" stroke="%231f4d3a" stroke-opacity=".07" stroke-width=".8"/>`;
+    }
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="400" height="200">${paths.replace(/%23/g, '#')}</svg>`;
+    return `url('data:image/svg+xml,${encodeURIComponent(svg)}')`;
+  })();
+
   function licenceCard(p) {
     let qr = '';
     try { const q = qrcode(0, 'M'); q.addData(location.href.split('#')[0] + '#licence-' + p.licence); q.make(); qr = q.createSvgTag({ cellSize: 3, margin: 0, scalable: true }); } catch (e) { qr = ''; }
-    return `<div class="lcard">
-      <div class="hd"><b>OHS OPERATOR LICENCE</b><span class="mono small">${p.licence}</span></div>
-      <div class="bd">
-        ${p.photo ? `<img class="ph" src="${p.photo}" alt="">` : `<div class="ph">${esc(initials(p.name))}</div>`}
-        <dl><dt>Name</dt><dd><b>${esc(p.name)}</b></dd><dt>Born</dt><dd>${p.dob ? fmtDate(p.dob) : '—'}</dd><dt>Trainee</dt><dd class="mono">${p.id}</dd>
-          <dt>Issued</dt><dd>${fmtDate(p.issued)}</dd><dt>Expires</dt><dd>${fmtDate(expiry(p.issued))}</dd>
-          <dt>Classes</dt><dd>${p.classes.map(c => `<span class="tag" title="${esc(CLASSES[c])}">${c}</span>`).join('')}</dd></dl>
-        <div class="qr" style="width:92px">${qr}</div>
+    const stCls = p.status === 'Current' ? 'ok' : p.status === 'Suspended' ? 'bad' : 'warn';
+    return `<div class="lflip" id="lflip" title="Tap to turn the card over">
+      <div class="lin">
+        <div class="lface front" style="background-image:${GUILLOCHE}">
+          <div class="ltop">
+            <div class="lbrand"><svg viewBox="0 0 32 32" width="18" height="18"><path d="M7 22 L13 10 L19 22 Z" fill="currentColor"/><rect x="20" y="15" width="5" height="7" fill="currentColor"/></svg><span>SkillPass&nbsp;TL</span></div>
+            <span class="lpill ${stCls}">${esc(p.status)}</span>
+          </div>
+          <div class="lmain">
+            ${p.photo ? `<img class="lph" src="${p.photo}" alt="">` : `<div class="lph lini">${esc(initials(p.name))}</div>`}
+            <div class="linfo">
+              <div class="lkind">Operator licence · High-risk work</div>
+              <div class="lname">${esc(p.name)}</div>
+              <div class="lno">${p.licence}</div>
+              <div class="lmeta">
+                <div><span>Born</span>${p.dob ? fmtDate(p.dob) : '—'}</div>
+                <div><span>Issued</span>${fmtDate(p.issued)}</div>
+                <div><span>Expires</span>${fmtDate(expiry(p.issued))}</div>
+              </div>
+            </div>
+          </div>
+          <div class="lclasses">${p.classes.map(c => `<span>${c}</span>`).join('')}</div>
+          <div class="ltais"></div>
+        </div>
+        <div class="lface back">
+          <div class="lqr">${qr}</div>
+          <div class="lback-info">
+            <div class="lkind light">Licensed classes</div>
+            <ul>${p.classes.map(c => `<li><b>${c}</b>${esc(CLASSES[c])}</li>`).join('')}</ul>
+          </div>
+          <div class="lbfoot"><span>Trainee ${p.id}</span><span>Valid until ${fmtDate(expiry(p.issued))}</span></div>
+          <div class="lfine">Scan the code to check this licence is current.</div>
+          <div class="ltais"></div>
+        </div>
       </div>
-      <div class="ft"><span>Status: <b>${p.status}</b></span><span>Scan to verify</span></div>
-    </div>`;
+    </div>
+    <div class="row small mute" style="justify-content:center;margin-top:8px">Tap the card to turn it over</div>`;
   }
+
   function openLicence(no) {
     const p = DB.people.find(x => x.licence === no);
     if (!p) { modal('<h2>Licence not found</h2><p class="small">This number is not on the register on this device.</p>'); return; }
@@ -533,6 +711,7 @@
       <h2 style="margin-top:16px">Classes</h2><ul class="list small">${p.classes.map(c => `<li><span><span class="tag">${c}</span> ${esc(CLASSES[c])}</span><span class="mute">${p.status === 'Pending assessment' ? 'Assessment pending' : 'Competent'}</span></li>`).join('')}</ul>
       <h2 style="margin-top:12px">Recent check-ins</h2>${hist.length ? `<ul class="list small">${hist.map(c => `<li><span>${fmtDate(c.date)} ${c.time} · ${esc(site(c.site).name.split(' — ')[0])}</span><span>${c.method}</span></li>`).join('')}</ul>` : '<p class="small mute">None yet.</p>'}
       ${p.status === 'Pending assessment' ? '<div class="row" style="margin-top:12px"><button class="btn" id="passIt">Record assessment passed</button></div>' : ''}`);
+    const fl = $('#lflip'); if (fl) fl.onclick = () => fl.classList.toggle('flipped');
     const b = $('#passIt'); if (b) b.onclick = () => { p.status = 'Current'; store.save(); openLicence(no); render(); toast('Licence now current.'); };
   }
 
