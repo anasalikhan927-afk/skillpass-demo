@@ -136,11 +136,17 @@
       if (!window.faceapi) { if (statusEl) statusEl.textContent = 'Face library did not load.'; return false; }
       if (!this.loading) {
         this.loading = (async () => {
-          const base = 'models';
-          await faceapi.nets.tinyFaceDetector.loadFromUri(base);
-          await faceapi.nets.faceLandmark68TinyNet.loadFromUri(base);
-          await faceapi.nets.faceRecognitionNet.loadFromUri(base);
-          this.ready = true;
+          const bases = ['https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.15/model', 'models'];
+          let lastErr;
+          for (const base of bases) {
+            try {
+              await faceapi.nets.tinyFaceDetector.loadFromUri(base);
+              await faceapi.nets.faceLandmark68TinyNet.loadFromUri(base);
+              await faceapi.nets.faceRecognitionNet.loadFromUri(base);
+              this.ready = true; return;
+            } catch (e) { lastErr = e; }
+          }
+          throw lastErr;
         })();
       }
       if (statusEl) statusEl.textContent = 'Loading face models (first time only, ~7 MB)…';
