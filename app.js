@@ -509,7 +509,7 @@
         if (!store.save()) { DB.people.shift(); return; }
         updateSync();
         reg = null; toast(`Saved on this device: ${p.name} (${p.id}).`);
-        location.hash = 'licence-' + p.licence;
+        justRegistered = p.licence; location.hash = 'licence-' + p.licence;
       };
     }
   };
@@ -521,7 +521,7 @@
     const sess = DB.sessions.filter(x => x.site === currentSite && x.date >= todayISO()).sort((a, b) => a.date.localeCompare(b.date))[0];
     return `<h1>Check-in &amp; verify</h1>
       <p class="lede">Confirms that the person at the class or assessment is the registered trainee. Site: <b>${esc(s.name)}</b>${sess ? ` · next class <span class="tag">${sess.course}</span> ${fmtDate(sess.date)}` : ''}.</p>
-      <div class="tabs"><button data-t="face" class="${ciTab === 'face' ? 'on' : ''}">Face</button><button data-t="finger" class="${ciTab === 'finger' ? 'on' : ''}">Fingerprint</button><button data-t="no" class="${ciTab === 'no' ? 'on' : ''}">Licence number</button></div>
+      <div class="tabs"><button data-t="face" class="${ciTab === 'face' ? 'on' : ''}">Face</button><button data-t="finger" class="${ciTab === 'finger' ? 'on' : ''}">Fingerprint</button><button data-t="qr" class="${ciTab === 'qr' ? 'on' : ''}">Scan card</button><button data-t="no" class="${ciTab === 'no' ? 'on' : ''}">Licence number</button></div>
       <div class="grid g2e">
         <div class="panel" id="ciLeft"></div>
         <div class="panel"><h2>Result</h2><div id="ciRes"><p class="mute small">Waiting for a check.</p></div></div>
@@ -583,6 +583,55 @@
           showResult(p, 'Fingerprint', 'device', 'Fingerprint confirmed by device sensor');
         } catch (e) { $('#fpMsg').innerHTML = `<span class="st warn">${esc(fingerError(e))}</span>`; }
       });
+    } else if (ciTab === 'qr') {
+      L.innerHTML = `<h2>Scan the QR on a licence card</h2>
+        <div class="cam" id="qrCam"><div class="empty">Camera is off</div><div class="qrframe" hidden></div><div class="msg" hidden></div></div>
+        <div class="row" style="margin-top:10px"><button class="btn" id="qrStart">Start scanning</button></div>
+        <p class="small mute" style="margin-top:8px">Works with the card on paper or on another phone's screen.</p>`;
+      const cam = $('#qrCam'), msg = $('.msg', cam);
+      const say = (t) => { msg.hidden = !t; msg.textContent = t || ''; };
+      $('#qrStart').onclick = async () => {
+        stopCamera();
+        if (!window.jsQR) { say('QR reader did not load. Check the internet connection.'); return; }
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+        } catch (e) { $('.empty', cam).textContent = 'Camera not available here.'; return; }
+        const v = document.createElement('video'); v.playsInline = true; v.muted = true; v.setAttribute('playsinline', ''); v.srcObject = stream;
+        v.style.transform = 'none';
+        cam.querySelectorAll('video').forEach(n => n.remove()); cam.prepend(v); await v.play();
+        $('.empty', cam).hidden = true; $('.qrframe', cam).hidden = false; $('#qrStart').hidden = true;
+        say('Point at the QR code');
+        const c = document.createElement('canvas'), g = c.getContext('2d', { willReadFrequently: true });
+        const loop = () => {
+          if (!stream) return;
+          if (v.readyState >= 2 && v.videoWidth) {
+            const s = Math.min(1, 720 / Math.max(v.videoWidth, v.videoHeight));
+            c.width = Math.round(v.videoWidth * s); c.height = Math.round(v.videoHeight * s);
+            g.drawImage(v, 0, 0, c.width, c.height);
+            const code = jsQR(g.getImageData(0, 0, c.width, c.height).data, c.width, c.height, { inversionAttempts: 'dontInvert' });
+            if (code && code.data) {
+              const m = code.data.split('#v-')[1];
+              const d = m && decodePayload(m);
+              if (!d) { say('That is not a SkillPass licence code'); }
+              else {
+                stopCamera(); $('#qrStart').hidden = false; $('#qrStart').textContent = 'Scan another'; $('.qrframe', cam).hidden = true;
+                say('Code read');
+                const p = DB.people.find(x => x.licence === d.licence);
+                if (!d.intact) { $('#ciRes').innerHTML = '<div class="result bad"><div><div class="big">Code has been altered</div><div class="small">Do not accept this card.</div></div></div>'; return; }
+                if (p) { showResult(p, 'Card QR', '—', 'Licence card scanned'); return; }
+                $('#ciRes').innerHTML = `<div class="result ${d.status === 'Current' ? 'ok' : 'bad'}"><div class="avatar">${esc(initials(d.name))}</div><div>
+                  <div class="big">${d.status === 'Current' ? 'Valid licence' : esc(d.status)}: ${esc(d.name)}</div><div class="small mono">${d.id} · ${d.licence}</div>
+                  <div style="margin-top:4px">${d.classes.map(c => `<span class="tag">${c}</span>`).join('')}</div></div></div>
+                  <p class="small mute" style="margin-top:8px">Not on this device's register — details read from the card.</p>
+                  <a class="btn alt" href="#v-${m}">Open full licence check</a>`;
+                return;
+              }
+            }
+          }
+          scanTimer = setTimeout(loop, 160);
+        };
+        loop();
+      };
     } else {
       L.innerHTML = `<h2>Look up by licence or trainee no.</h2><form id="lnF" class="row"><input name="q" placeholder="TL-OHS-26-04410 or SP-10231" style="flex:1;min-width:200px"><button class="btn">Find</button></form>
         <p class="small mute" style="margin-top:8px">For when a camera or sensor is not available. Staff compare the photo on screen with the person.</p>`;
@@ -647,6 +696,29 @@
     };
   };
 
+  // ---------- QR payload: the licence details travel inside the QR, so any phone can read them ----------
+  const b64e = (s) => btoa(unescape(encodeURIComponent(s))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const b64d = (s) => { s = s.replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '='; return decodeURIComponent(escape(atob(s))); };
+  const ST = { 'Current': 'C', 'Pending assessment': 'P', 'Suspended': 'S' };
+  const STR = { C: 'Current', P: 'Pending assessment', S: 'Suspended' };
+  function sum(s) { let h = 7; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0; return (h % 46656).toString(36); }
+  function payloadFor(p) {
+    const body = [p.licence, p.id, p.name, p.dob || '', p.mun || '', p.classes.join('.'), p.issued, ST[p.status] || 'P'].join('|');
+    return b64e(body + '|' + sum(body));
+  }
+  function decodePayload(s) {
+    try {
+      const parts = b64d(s).split('|'); if (parts.length !== 9) return null;
+      const chk = parts.pop(); const ok = sum(parts.join('|')) === chk;
+      const [licence, id, name, dob, mun, cls, issued, st] = parts;
+      return { licence, id, name, dob, mun, classes: cls ? cls.split('.') : [], issued, status: STR[st] || 'Pending assessment', photo: null, intact: ok };
+    } catch (e) { return null; }
+  }
+  const verifyUrl = (p) => location.origin + location.pathname + '#v-' + payloadFor(p);
+  function qrSvg(text) {
+    try { const q = qrcode(0, 'L'); q.addData(text); q.make(); return q.createSvgTag({ cellSize: 4, margin: 0, scalable: true }); } catch (e) { return ''; }
+  }
+
   const GUILLOCHE = (function () {
     let paths = '';
     for (let k = 0; k < 9; k++) {
@@ -661,9 +733,9 @@
     return `url('data:image/svg+xml,${encodeURIComponent(svg)}')`;
   })();
 
-  function licenceCard(p) {
-    let qr = '';
-    try { const q = qrcode(0, 'M'); q.addData(location.href.split('#')[0] + '#licence-' + p.licence); q.make(); qr = q.createSvgTag({ cellSize: 3, margin: 0, scalable: true }); } catch (e) { qr = ''; }
+  function licenceCard(p, opts) {
+    opts = opts || {};
+    const qr = qrSvg(verifyUrl(p));
     const stCls = p.status === 'Current' ? 'ok' : p.status === 'Suspended' ? 'bad' : 'warn';
     return `<div class="lflip" id="lflip" title="Tap to turn the card over">
       <div class="lin">
@@ -700,20 +772,61 @@
         </div>
       </div>
     </div>
-    <div class="row small mute" style="justify-content:center;margin-top:8px">Tap the card to turn it over</div>`;
+    ${opts.noHint ? '' : '<div class="row small mute" style="justify-content:center;margin-top:8px">Tap the card to turn it over</div>'}`;
   }
 
+  function bindFlip() {
+    const fl = $('#lflip'); if (!fl) return;
+    fl.onclick = () => {
+      const lin = $('.lin', fl); if (lin.classList.contains('turning')) return;
+      lin.classList.add('turning');
+      setTimeout(() => { fl.classList.toggle('flipped'); lin.classList.remove('turning'); }, 170);
+    };
+  }
+  let justRegistered = null;
   function openLicence(no) {
     const p = DB.people.find(x => x.licence === no);
     if (!p) { modal('<h2>Licence not found</h2><p class="small">This number is not on the register on this device.</p>'); return; }
     const hist = DB.checkins.filter(c => c.pid === p.id).slice(-5).reverse();
-    modal(`${licenceCard(p)}
+    const fresh = justRegistered === no; justRegistered = null;
+    modal(`${fresh ? '<div class="regok"><b>Registered and saved.</b> Scan the QR code below with any other phone to see this licence.</div>' : ''}
+      ${licenceCard(p)}
+      ${p.status === 'Pending assessment' ? '<div class="pendbar"><span>Assessment not yet recorded — the QR will show “not yet licensed”.</span><button class="btn" id="passIt">Record assessment passed</button></div>' : ''}
+      <div class="bigqr"><div class="bigqr-code">${qrSvg(verifyUrl(p))}</div>
+        <div><b>Scan to verify</b><p class="small">Point any phone camera at this code. It opens the licence details on that phone — no app needed.</p>
+        <button class="btn alt" id="copyLink">Copy verify link</button></div></div>
       <h2 style="margin-top:16px">Classes</h2><ul class="list small">${p.classes.map(c => `<li><span><span class="tag">${c}</span> ${esc(CLASSES[c])}</span><span class="mute">${p.status === 'Pending assessment' ? 'Assessment pending' : 'Competent'}</span></li>`).join('')}</ul>
       <h2 style="margin-top:12px">Recent check-ins</h2>${hist.length ? `<ul class="list small">${hist.map(c => `<li><span>${fmtDate(c.date)} ${c.time} · ${esc(site(c.site).name.split(' — ')[0])}</span><span>${c.method}</span></li>`).join('')}</ul>` : '<p class="small mute">None yet.</p>'}
-      ${p.status === 'Pending assessment' ? '<div class="row" style="margin-top:12px"><button class="btn" id="passIt">Record assessment passed</button></div>' : ''}`);
-    const fl = $('#lflip'); if (fl) fl.onclick = () => fl.classList.toggle('flipped');
-    const b = $('#passIt'); if (b) b.onclick = () => { p.status = 'Current'; store.save(); openLicence(no); render(); toast('Licence now current.'); };
+`);
+    bindFlip();
+    const cl = $('#copyLink'); if (cl) cl.onclick = () => { navigator.clipboard.writeText(verifyUrl(p)).then(() => toast('Link copied.'), () => toast('Could not copy on this device.')); };
+    const b = $('#passIt'); if (b) b.onclick = () => { p.status = 'Current'; store.save(); openLicence(no); render(); toast('Licence is now current. The QR code has been updated.'); };
   }
+
+  // Public verify page (opened from a scanned QR)
+  let verifyData = null;
+  V.verify = function () {
+    const d = verifyData;
+    if (!d) return `<h1>Verify a licence</h1><div class="result bad"><div><div class="big">This QR code could not be read</div><div class="small">It may be damaged or not a SkillPass code.</div></div></div>`;
+    const local = DB.people.find(x => x.licence === d.licence);
+    const p = local ? Object.assign({}, d, { photo: local.photo, status: local.status }) : d;
+    const ok = d.intact && p.status === 'Current';
+    const cls = !d.intact ? 'bad' : p.status === 'Current' ? 'ok' : p.status === 'Suspended' ? 'bad' : 'warn';
+    const head = !d.intact ? 'Code has been altered — do not accept' : p.status === 'Current' ? 'Valid licence' : p.status === 'Suspended' ? 'Licence suspended — not allowed on site' : 'Not yet licensed — assessment pending';
+    return `<h1>Licence check</h1>
+      <div class="vbanner ${cls}"><div class="vicon">${ok ? '✓' : '!'}</div><div><div class="big">${head}</div><div class="small">${esc(p.name)} · ${p.licence}</div></div></div>
+      <div style="margin:18px 0">${licenceCard(p)}</div>
+      <div class="panel"><h2>May operate</h2>
+        <ul class="list">${p.classes.map(c => `<li><span><span class="tag">${c}</span> ${esc(CLASSES[c] || c)}</span><span class="st ${ok ? 'ok' : 'warn'}">${ok ? 'Yes' : 'No'}</span></li>`).join('')}</ul>
+        <ul class="list small" style="margin-top:8px">
+          <li><span>Trainee no.</span><span class="mono">${p.id}</span></li>
+          <li><span>Municipality</span><span>${esc(p.mun || '—')}</span></li>
+          <li><span>Valid until</span><span>${fmtDate(expiry(p.issued))}</span></li>
+        </ul>
+        <p class="small mute" style="margin-top:10px">${local ? 'Matched to the register on this device.' : 'Details read from the code on the card. In the full system this check is made live against the central register in Dili, which also returns the photo.'}</p>
+      </div>`;
+  };
+  V.verify.after = function () { bindFlip(); };
 
   // Classes
   V.classes = function () {
@@ -754,7 +867,7 @@
   };
 
   // ---------- router ----------
-  const TITLES = { overview: 'Overview', register: 'Register trainee', checkin: 'Check-in & verify', licences: 'Licence register', classes: 'Classes', sites: 'Sites & links' };
+  const TITLES = { verify: 'Licence check', overview: 'Overview', register: 'Register trainee', checkin: 'Check-in & verify', licences: 'Licence register', classes: 'Classes', sites: 'Sites & links' };
   function render() {
     $('#view').innerHTML = V[route]();
     if (V[route].after) V[route].after();
@@ -764,6 +877,10 @@
   function onHash() {
     const h = (location.hash || '#overview').slice(1);
     stopCamera();
+    if (h.startsWith('v-')) {
+      if (!$('#modal').hidden) { $('#modal').hidden = true; $('#modalBody').innerHTML = ''; }
+      verifyData = decodePayload(h.slice(2)); route = 'verify'; render(); window.scrollTo(0, 0); return;
+    }
     if (h.startsWith('licence-')) {
       if (route !== 'licences') { route = 'licences'; render(); }
       openLicence(h.slice(8));
