@@ -103,6 +103,82 @@
     return p.photo ? `<img class="${cls}" src="${p.photo}" alt="">` : `<div class="${cls}">${esc(initials(p.name))}</div>`;
   }
 
+  // ---------- cloud register (Supabase) ----------
+  // Fill in config.js with the project URL and the *publishable* key to turn this on.
+  const CFG = window.SKILLPASS_CLOUD || {};
+  const newId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  const Cloud = {
+    on: !!(CFG.url && CFG.key), state: 'off', last: null, err: '', busy: false, again: false,
+    headers(extra) {
+      const h = { apikey: CFG.key, 'Content-Type': 'application/json' };
+      if (/^eyJ/.test(CFG.key)) h.Authorization = 'Bearer ' + CFG.key; // legacy anon key
+      return Object.assign(h, extra || {});
+    },
+    async req(path, opt) {
+      opt = opt || {};
+      const r = await fetch(CFG.url.replace(/\/$/, '') + '/rest/v1/' + path, { method: opt.method || 'GET', headers: this.headers(opt.headers), body: opt.body });
+      if (!r.ok) throw new Error(r.status + ' ' + (await r.text()).slice(0, 160));
+      const t = await r.text(); return t ? JSON.parse(t) : null;
+    },
+    toRow(p) {
+      return { id: p.id, licence: p.licence, name: p.name, dob: p.dob || null, phone: p.phone || null, mun: p.mun || null, employer: p.employer || null,
+        classes: p.classes, issued: p.issued, status: p.status, face: p.face || null, photo: p.photo || null, updated_at: new Date().toISOString() };
+    },
+    fromRow(r) {
+      return { id: r.id, licence: r.licence, name: r.name, dob: r.dob, phone: r.phone, mun: r.mun, employer: r.employer || 'Independent',
+        classes: r.classes || [], issued: r.issued, status: r.status, face: r.face, photo: r.photo, cred: null, created: (r.created_at || '').slice(0, 10) };
+    },
+    cRow(c) { return { cid: c.cid, trainee_id: c.pid, site: c.site, method: c.method, score: c.score == null ? null : String(c.score), date: c.date, time: c.time, session: c.session }; },
+    cFrom(r) { return { cid: r.cid, pid: r.trainee_id, site: r.site, method: r.method, score: r.score, date: r.date, time: r.time, session: r.session, synced: true }; },
+    upsert(table, rows, key) {
+      return this.req(table + '?on_conflict=' + key, { method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(rows) });
+    },
+    async sync() {
+      if (!this.on) return;
+      if (this.busy) { this.again = true; return; }
+      this.busy = true; this.state = 'syncing'; updateSync();
+      try {
+        // 1. send local changes
+        const dirty = DB.people.filter(p => p._dirty);
+        if (dirty.length) {
+          const sent = dirty.map(p => [p, JSON.stringify(this.toRow(p).status) + p.classes.join()]);
+          await this.upsert('trainees', dirty.map(p => this.toRow(p)), 'id');
+          sent.forEach(([p, sig]) => { if (JSON.stringify(p.status) + p.classes.join() === sig) delete p._dirty; });
+        }
+        DB.checkins.forEach(c => { if (!c.cid) c.cid = newId(); });
+        const unsent = DB.checkins.filter(c => !c.synced && DB.people.some(p => p.id === c.pid));
+        // 2. fetch the shared register
+        const rows = await this.req('trainees?select=*&order=created_at.desc&limit=2000');
+        const ids = new Set(rows.map(r => r.id));
+        rows.forEach(r => {
+          const p = this.fromRow(r), i = DB.people.findIndex(x => x.id === p.id);
+          if (i < 0) DB.people.push(p);
+          else if (!DB.people[i]._dirty) { p.cred = DB.people[i].cred; DB.people[i] = p; } // never overwrite unsent local changes
+        });
+        const missing = DB.people.filter(p => !ids.has(p.id));
+        if (missing.length) await this.upsert('trainees', missing.map(p => this.toRow(p)), 'id');
+        if (unsent.length) { await this.upsert('checkins', unsent.map(c => this.cRow(c)), 'cid'); unsent.forEach(c => c.synced = true); }
+        const cs = await this.req('checkins?select=*&order=created_at.desc&limit=1000');
+        const have = new Set(DB.checkins.map(c => c.cid));
+        cs.reverse().forEach(r => { if (!have.has(r.cid)) DB.checkins.push(this.cFrom(r)); });
+        DB.queue = 0; store.save();
+        this.state = 'ok'; this.err = ''; this.last = new Date();
+        if (['overview', 'licences'].includes(route) && $('#modal').hidden && !document.activeElement.matches('input,select,textarea')) render();
+      } catch (e) {
+        console.error(e); this.state = 'error'; this.err = String(e.message || e);
+        DB.queue = DB.people.filter(p => p._dirty).length + DB.checkins.filter(c => !c.synced).length; store.save();
+      }
+      this.busy = false; updateSync();
+      if (this.again) { this.again = false; this.sync(); }
+    },
+    async findLicence(lic) {
+      if (!this.on) return null;
+      const rows = await this.req('trainees?select=*&licence=eq.' + encodeURIComponent(lic));
+      return rows && rows[0] ? this.fromRow(rows[0]) : null;
+    }
+  };
+  function changed(p) { if (p) p._dirty = true; store.save(); Cloud.sync(); }
+
   // ---------- live link simulation ----------
   const live = {};
   function tickLinks() {
@@ -122,10 +198,18 @@
 
   function updateSync() {
     const on = navigator.onLine !== false;
-    $('#sync .dot').className = 'dot' + (on ? '' : ' off');
-    $('#syncText').textContent = on ? (DB.queue ? `Online · ${DB.queue} to sync` : 'Online · all records synced') : `Offline · ${DB.queue} queued`;
+    let txt, bad = !on;
+    if (!Cloud.on) txt = on ? 'Saved on this device only' : 'Offline';
+    else if (!on) txt = `Offline · ${DB.queue} waiting to upload`;
+    else if (Cloud.state === 'syncing') txt = 'Cloud register · syncing…';
+    else if (Cloud.state === 'error') { txt = 'Cloud not reachable · saved on device'; bad = true; }
+    else if (Cloud.last) txt = 'Cloud register · synced ' + Cloud.last.toTimeString().slice(0, 5);
+    else txt = 'Cloud register · connecting…';
+    $('#sync .dot').className = 'dot' + (bad ? ' off' : '');
+    $('#syncText').textContent = txt;
+    const m = $('#cloudMini'); if (m) { m.textContent = txt; m.className = 'cloudmini' + (bad ? ' off' : ''); }
   }
-  window.addEventListener('online', () => { DB.queue = 0; store.save(); updateSync(); toast('Connection back. Queued records synced.'); });
+  window.addEventListener('online', () => { updateSync(); Cloud.sync(); });
   window.addEventListener('offline', updateSync);
 
   // ---------- header ----------
@@ -506,9 +590,10 @@
           classes: reg.data.classes, issued: todayISO(), status: 'Pending assessment', licence: 'TL-OHS-' + yy + '-' + String(Math.floor(10000 + Math.random() * 89999)),
           face: reg.face, photo: reg.photo, cred: reg.cred, created: todayISO() };
         DB.people.unshift(p); if (navigator.onLine === false) DB.queue++;
+        p._dirty = true;
         if (!store.save()) { DB.people.shift(); return; }
-        updateSync();
-        reg = null; toast(`Saved on this device: ${p.name} (${p.id}).`);
+        Cloud.sync(); updateSync();
+        reg = null; toast(Cloud.on ? `Saved: ${p.name} (${p.id}). Uploading to the cloud register…` : `Saved on this device: ${p.name} (${p.id}).`);
         justRegistered = p.licence; location.hash = 'licence-' + p.licence;
       };
     }
@@ -530,9 +615,9 @@
   function recordCheckin(p, method, score) {
     const sess = DB.sessions.filter(x => x.site === currentSite && x.date >= todayISO()).sort((a, b) => a.date.localeCompare(b.date))[0];
     const up = live[currentSite] && live[currentSite].up && navigator.onLine !== false;
-    DB.checkins.push({ pid: p.id, site: currentSite, method, score, date: todayISO(), time: new Date().toTimeString().slice(0, 5), session: sess ? sess.id : null });
-    if (!up) DB.queue++;
-    store.save(); updateSync();
+    DB.checkins.push({ cid: newId(), pid: p.id, site: currentSite, method, score, date: todayISO(), time: new Date().toTimeString().slice(0, 5), session: sess ? sess.id : null });
+    if (!up && !Cloud.on) DB.queue++;
+    changed(null); updateSync();
     return { sess, up };
   }
   function showResult(p, method, score, extra) {
@@ -658,7 +743,7 @@
           <td><span class="st ${p.status === 'Current' ? 'ok' : p.status === 'Suspended' ? 'bad' : 'warn'}">${p.status}</span></td>
           <td class="small hide-m">${p.face ? 'Face' : ''}${p.face && p.cred ? ' · ' : ''}${p.cred ? 'Finger' : ''}${!p.face && !p.cred ? '<span class="mute">—</span>' : ''}</td></tr>`).join('')}
         </table>
-        <div class="note" style="margin-top:14px">Records are saved in this browser on this device. To move them to another phone or laptop, use <b>Back up</b> here and <b>Restore</b> there.</div>
+        <div class="note" style="margin-top:14px">${Cloud.on ? 'This register is shared: every phone and laptop using the link sees the same trainees and check-ins. <span id="cloudMini" class="cloudmini"></span>' : 'Records are saved in this browser on this device. To move them to another phone or laptop, use <b>Back up</b> here and <b>Restore</b> there.'}</div>
         <div class="row" style="margin-top:10px"><button class="btn alt" id="backup">Back up register</button>
           <label class="btn alt" style="display:inline-block">Restore from backup<input type="file" accept=".json,application/json" hidden id="restore"></label>
           <button class="btn alt" id="resetDemo">Reset demo data</button></div>
@@ -686,7 +771,7 @@
         });
         const seen = new Set(DB.checkins.map(c => c.pid + c.date + c.time));
         (data.checkins || []).forEach(c => { if (!seen.has(c.pid + c.date + c.time)) DB.checkins.push(c); });
-        store.save(); render(); toast(`Restored. ${added} trainee record${added === 1 ? '' : 's'} added or updated.`);
+        DB.people.forEach(p => p._dirty = true); changed(null); render(); toast(`Restored. ${added} trainee record${added === 1 ? '' : 's'} added or updated.`);
       }).catch(() => toast('That file is not a SkillPass backup.'));
       e.target.value = '';
     };
@@ -800,16 +885,16 @@
 `);
     bindFlip();
     const cl = $('#copyLink'); if (cl) cl.onclick = () => { navigator.clipboard.writeText(verifyUrl(p)).then(() => toast('Link copied.'), () => toast('Could not copy on this device.')); };
-    const b = $('#passIt'); if (b) b.onclick = () => { p.status = 'Current'; store.save(); openLicence(no); render(); toast('Licence is now current. The QR code has been updated.'); };
+    const b = $('#passIt'); if (b) b.onclick = () => { const q = DB.people.find(x => x.licence === no) || p; q.status = 'Current'; changed(q); openLicence(no); render(); toast('Licence is now current. The QR code has been updated.'); };
   }
 
   // Public verify page (opened from a scanned QR)
-  let verifyData = null;
+  let verifyData = null, verifyLive = null;
   V.verify = function () {
     const d = verifyData;
     if (!d) return `<h1>Verify a licence</h1><div class="result bad"><div><div class="big">This QR code could not be read</div><div class="small">It may be damaged or not a SkillPass code.</div></div></div>`;
-    const local = DB.people.find(x => x.licence === d.licence);
-    const p = local ? Object.assign({}, d, { photo: local.photo, status: local.status }) : d;
+    const local = (verifyLive && verifyLive.licence === d.licence) ? verifyLive : DB.people.find(x => x.licence === d.licence);
+    const p = local ? Object.assign({}, d, { photo: local.photo, status: local.status, classes: local.classes }) : d;
     const ok = d.intact && p.status === 'Current';
     const cls = !d.intact ? 'bad' : p.status === 'Current' ? 'ok' : p.status === 'Suspended' ? 'bad' : 'warn';
     const head = !d.intact ? 'Code has been altered — do not accept' : p.status === 'Current' ? 'Valid licence' : p.status === 'Suspended' ? 'Licence suspended — not allowed on site' : 'Not yet licensed — assessment pending';
@@ -823,7 +908,7 @@
           <li><span>Municipality</span><span>${esc(p.mun || '—')}</span></li>
           <li><span>Valid until</span><span>${fmtDate(expiry(p.issued))}</span></li>
         </ul>
-        <p class="small mute" style="margin-top:10px">${local ? 'Matched to the register on this device.' : 'Details read from the code on the card. In the full system this check is made live against the central register in Dili, which also returns the photo.'}</p>
+        <p class="small mute" style="margin-top:10px">${verifyLive && verifyLive.licence === d.licence ? 'Checked live against the cloud register just now.' : local ? 'Matched to the register on this device.' : Cloud.on ? 'Checking the cloud register…' : 'Details read from the code on the card. With the cloud register switched on, this check is made live and also returns the photo.'}</p>
       </div>`;
   };
   V.verify.after = function () { bindFlip(); };
@@ -879,7 +964,12 @@
     stopCamera();
     if (h.startsWith('v-')) {
       if (!$('#modal').hidden) { $('#modal').hidden = true; $('#modalBody').innerHTML = ''; }
-      verifyData = decodePayload(h.slice(2)); route = 'verify'; render(); window.scrollTo(0, 0); return;
+      verifyData = decodePayload(h.slice(2)); verifyLive = null; route = 'verify'; render(); window.scrollTo(0, 0);
+      if (verifyData && verifyData.intact && Cloud.on) {
+        const lic = verifyData.licence;
+        Cloud.findLicence(lic).then(r => { if (r && verifyData && verifyData.licence === lic && route === 'verify') { verifyLive = r; render(); } }).catch(() => {});
+      }
+      return;
     }
     if (h.startsWith('licence-')) {
       if (route !== 'licences') { route = 'licences'; render(); }
@@ -893,4 +983,5 @@
   window.addEventListener('hashchange', onHash);
   updateSync();
   onHash();
+  if (Cloud.on) { Cloud.sync(); setInterval(() => { if (document.visibilityState === 'visible') Cloud.sync(); }, 20000); }
 })();
